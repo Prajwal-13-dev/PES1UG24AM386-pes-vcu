@@ -23,6 +23,8 @@
 #define MODE_EXEC      0100755
 #define MODE_DIR       0040000
 
+
+
 // ─── PROVIDED ───────────────────────────────────────────────────────────────
 
 // Determine the object mode for a filesystem path.
