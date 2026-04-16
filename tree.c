@@ -15,6 +15,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include "index.h"
 
 // ─── Mode Constants ─────────────────────────────────────────────────────────
 
@@ -129,9 +130,107 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //   - object_write    : save that binary buffer to the store as OBJ_TREE
 //
 // Returns 0 on success, -1 on error.
+// Recursive helper function to build trees at specific directory depths
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+
+// 2. The "Weak" Dummy Function (Fixes the Makefile Linker Bug)
+// Because test_tree doesn't link index.o, this placeholder satisfies the compiler 
+// for Phase 2. Once you write the real index_load in Phase 3 and build the full 
+// 'pes' binary, the C compiler will automatically ignore this weak one!
+__attribute__((weak)) int index_load(Index *index) {
+    if (index) index->count = 0;
+    return 0;
+}
+
+// Recursive helper function to build trees at specific directory depths
+static int build_tree_level(IndexEntry *entries, int count, int path_offset, ObjectID *out_id) {
+    Tree tree;
+    tree.count = 0;
+
+    int i = 0;
+    while (i < count) {
+        const char *subpath = entries[i].path + path_offset;
+        char *slash = strchr(subpath, '/');
+
+        if (!slash) {
+            // BASE CASE: It's a file in the current directory level
+            if (tree.count >= MAX_TREE_ENTRIES) return -1;
+            
+            TreeEntry *entry = &tree.entries[tree.count++];
+            entry->mode = entries[i].mode;
+            entry->hash = entries[i].hash; 
+            
+            // Fix for the strncpy truncation warning: Use snprintf
+            snprintf(entry->name, sizeof(entry->name), "%s", subpath);
+            
+            i++;
+        } else {
+            // RECURSIVE CASE: It's a subdirectory
+            int dir_len = slash - subpath;
+            char dir_name[256];
+            
+            if (dir_len >= (int)sizeof(dir_name)) return -1;
+            
+            // Fix for the strncpy truncation warning: Use snprintf
+            snprintf(dir_name, dir_len + 1, "%s", subpath);
+
+            // Find all contiguous entries that belong in this subdirectory
+            int j = i;
+            while (j < count) {
+                const char *j_subpath = entries[j].path + path_offset;
+                if (strncmp(j_subpath, dir_name, dir_len) == 0 && j_subpath[dir_len] == '/') {
+                    j++;
+                } else {
+                    break;
+                }
+            }
+
+            // Recursively build the subtree for this directory
+            ObjectID subtree_id;
+            if (build_tree_level(&entries[i], j - i, path_offset + dir_len + 1, &subtree_id) != 0) {
+                return -1;
+            }
+
+            // Add the new directory tree to our current tree
+            if (tree.count >= MAX_TREE_ENTRIES) return -1;
+            
+            TreeEntry *entry = &tree.entries[tree.count++];
+            entry->mode = MODE_DIR; // 0040000
+            entry->hash = subtree_id;
+            
+            // Fix for the strncpy truncation warning: Use snprintf
+            snprintf(entry->name, sizeof(entry->name), "%s", dir_name);
+
+            i = j; // Skip past all entries handled by the recursive call
+        }
+    }
+
+    // Serialize the populated Tree struct into binary
+    void *tree_data = NULL;
+    size_t tree_len = 0;
+    if (tree_serialize(&tree, &tree_data, &tree_len) != 0) {
+        return -1;
+    }
+
+    // Write the raw binary to the object store
+    int write_res = object_write(OBJ_TREE, tree_data, tree_len, out_id);
+    
+    free(tree_data);
+    return write_res;
+}
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    Index idx;
+    
+    // Load the staged files into memory
+    if (index_load(&idx) != 0) {
+        return -1; 
+    }
+
+    // If the index is completely empty, fail safely
+    if (idx.count == 0) {
+        return -1;
+    }
+
+    // Kick off recursion from the root (path_offset = 0)
+    return build_tree_level(idx.entries, idx.count, 0, id_out);
 }
