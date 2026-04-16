@@ -24,6 +24,8 @@
 #include <unistd.h>
 #include <dirent.h>
 
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
 // Find an index entry by path (linear scan).
@@ -126,7 +128,12 @@ int index_status(const Index *index) {
 }
 
 // ─── TODO: Implement these ───────────────────────────────────────────────────
-
+// 2. Comparator function to sort IndexEntries (MUST be defined before index_save)
+static int compare_index_entries(const void *a, const void *b) {
+    const IndexEntry *entry_a = (const IndexEntry *)a;
+    const IndexEntry *entry_b = (const IndexEntry *)b;
+    return strcmp(entry_a->path, entry_b->path);
+}
 // Load the index from .pes/index.
 //
 // HINTS - Useful functions:
@@ -135,10 +142,35 @@ int index_status(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_load(Index *index) {
-    // TODO: Implement index loading
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    // Start with an empty index
+    index->count = 0;
+    
+    // Open the index file for reading
+    FILE *f = fopen(".pes/index", "r");
+    if (!f) {
+        // If it doesn't exist, it's not an error (just an empty staging area)
+        return 0; 
+    }
+
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        if (index->count >= MAX_INDEX_ENTRIES) break;
+
+        IndexEntry *entry = &index->entries[index->count];
+        char hex_hash[65];
+        
+        // Parse the line format: <mode> <hash-hex> <mtime> <size> <path>
+        if (sscanf(line, "%o %64s %lu %u %[^\n]", 
+                   &entry->mode, hex_hash, &entry->mtime_sec, &entry->size, entry->path) == 5) {
+            
+            // Convert the parsed hex string back into the binary ObjectID struct
+            if (hex_to_hash(hex_hash, &entry->hash) == 0) {
+                index->count++;
+            }
+        }
+    }
+    fclose(f);
+    return 0;
 }
 
 // Save the index to .pes/index atomically.
@@ -152,10 +184,54 @@ int index_load(Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_save(const Index *index) {
-    // TODO: Implement atomic index saving
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    IndexEntry *sorted_entries = NULL;
+    
+    if (index->count > 0) {
+        sorted_entries = malloc(index->count * sizeof(IndexEntry));
+        if (!sorted_entries) return -1;
+        
+        // Copy just the active entries and sort them
+        memcpy(sorted_entries, index->entries, index->count * sizeof(IndexEntry));
+        qsort(sorted_entries, index->count, sizeof(IndexEntry), compare_index_entries);
+    }
+
+    char temp_path[] = ".pes/index_XXXXXX";
+    int fd = mkstemp(temp_path);
+    if (fd == -1) {
+        free(sorted_entries);
+        return -1;
+    }
+
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        free(sorted_entries);
+        return -1;
+    }
+
+    for (int i = 0; i < index->count; i++) {
+        const IndexEntry *entry = &sorted_entries[i];
+        char hex_hash[65];
+        hash_to_hex(&entry->hash, hex_hash);
+        
+        fprintf(f, "%06o %s %lu %u %s\n", 
+                entry->mode, hex_hash, entry->mtime_sec, entry->size, entry->path);
+    }
+
+    // Free the heap memory when we are done!
+    if (sorted_entries) {
+        free(sorted_entries);
+    }
+
+    fflush(f);
+    fsync(fd);
+    fclose(f); 
+
+    if (rename(temp_path, ".pes/index") != 0) {
+        return -1;
+    }
+
+    return 0;
 }
 
 // Stage a file for the next commit.
@@ -168,8 +244,47 @@ int index_save(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_add(Index *index, const char *path) {
-    // TODO: Implement file staging
-    // (See Lab Appendix for logical steps)
-    (void)index; (void)path;
-    return -1;
+struct stat st;
+    
+    // 1. Check if file exists and get metadata
+    if (stat(path, &st) != 0) return -1; 
+    if (!S_ISREG(st.st_mode)) return -1; // We only track regular files, not directories
+
+    // 2. Read the full file contents into memory
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    void *buffer = malloc(st.st_size);
+    if (st.st_size > 0 && fread(buffer, 1, st.st_size, f) != (size_t)st.st_size) {
+        free(buffer);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    // 3. Write the file content as a Blob to the object store
+    ObjectID blob_id;
+    if (object_write(OBJ_BLOB, buffer, st.st_size, &blob_id) != 0) {
+        free(buffer);
+        return -1;
+    }
+    free(buffer);
+
+    // 4. Update or Create the Index Entry
+    IndexEntry *entry = index_find(index, path);
+    if (!entry) {
+        // File is not staged yet, create a new entry at the end
+        if (index->count >= MAX_INDEX_ENTRIES) return -1; // Index full
+        entry = &index->entries[index->count++];
+        
+        snprintf(entry->path, sizeof(entry->path), "%s", path);
+    }
+
+    // Assign Git-style octal modes based on executable permissions
+    entry->mode = (st.st_mode & S_IXUSR) ? 0100755 : 0100644;
+    entry->hash = blob_id;
+    entry->mtime_sec = st.st_mtime;
+    entry->size = st.st_size;
+
+    return index_save(index);
 }
